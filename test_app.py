@@ -3,8 +3,13 @@ from __future__ import annotations
 import datetime as dt
 import json
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from rich.table import Table
@@ -13,6 +18,7 @@ from textual.geometry import Size
 
 from app import (
     Halt,
+    Handler,
     Scanner,
     Store,
     parse_nasdaq_feed,
@@ -179,6 +185,52 @@ class HaltScannerTests(unittest.TestCase):
             self.assertEqual([item["symbol"] for item in payload["resumed"]], ["DONE"])
             self.assertEqual(payload["resumed"][0]["halt_duration_seconds"], 300)
             self.assertIn("resume_sort_at", payload["current"][0])
+
+    def test_health_expires_after_missed_polls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            scanner = Scanner(Store(str(Path(temp) / "halts.db")), poll_seconds=60)
+            now = dt.datetime.now(ET)
+            scanner.last_updated = now.isoformat()
+            self.assertTrue(scanner.healthy(now + dt.timedelta(seconds=180)))
+            self.assertFalse(scanner.healthy(now + dt.timedelta(seconds=181)))
+
+    def test_http_routes_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            scanner = Scanner(Store(str(Path(temp) / "halts.db")))
+            scanner.last_updated = dt.datetime.now(ET).isoformat()
+            Handler.scanner = scanner
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urllib.request.urlopen(f"{base}/healthz") as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), b"ok\n")
+                with urllib.request.urlopen(f"{base}/api/halts") as response:
+                    self.assertEqual(json.load(response)["current"], [])
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(f"{base}/api/history")
+                self.assertEqual(error.exception.code, 400)
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(f"{base}/api/history?symbol=TEST&limit=nope")
+                self.assertEqual(error.exception.code, 400)
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(f"{base}/missing")
+                self.assertEqual(error.exception.code, 404)
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join()
+
+    def test_poll_failure_is_reported_without_destroying_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            scanner = Scanner(Store(str(Path(temp) / "halts.db")))
+            with patch("app.fetch", side_effect=OSError("feed unavailable")):
+                scanner.poll_once()
+            self.assertEqual(scanner.last_error, "feed unavailable")
+            self.assertIsNone(scanner.last_updated)
+            self.assertEqual(scanner.payload()["current"], [])
 
     def test_history_and_csv_export(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

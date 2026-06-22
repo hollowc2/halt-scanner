@@ -3,6 +3,14 @@ services:
     build: .
     container_name: halt_scanner
     restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
     environment:
       HOST: 0.0.0.0
       PORT: 8010

@@ -416,6 +416,14 @@ class Scanner:
             self.poll_once()
             self.stop_event.wait(self.poll_seconds)
 
+    def healthy(self, now: dt.datetime | None = None) -> bool:
+        if not self.last_updated:
+            return False
+        now = now or dt.datetime.now(EASTERN)
+        updated = dt.datetime.fromisoformat(self.last_updated)
+        # ponytail: three missed polls is enough; add separate liveness/readiness only if orchestration needs it.
+        return now - updated <= dt.timedelta(seconds=max(180, self.poll_seconds * 3))
+
     @staticmethod
     def item(row: sqlite3.Row, now: dt.datetime) -> dict[str, Any]:
         item = dict(row)
@@ -577,8 +585,8 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/halts.csv":
             self._send(200, "text/csv; charset=utf-8", self.scanner.csv_export())
         elif url.path == "/healthz":
-            status = 200 if self.scanner.last_updated else 503
-            self._send(status, "text/plain", b"ok\n" if status == 200 else b"starting\n")
+            status = 200 if self.scanner.healthy() else 503
+            self._send(status, "text/plain", b"ok\n" if status == 200 else b"stale\n")
         else:
             self._send(404, "text/plain", b"not found\n")
 
