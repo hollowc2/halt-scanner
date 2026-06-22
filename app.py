@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
+import io
 import json
 import logging
 import os
@@ -133,6 +135,24 @@ def parse_yahoo_chart(payload: bytes, halt_at: dt.datetime) -> tuple[float | Non
     return round(change, 2), points
 
 
+def parse_yahoo_post_move(payload: bytes, resume_at: dt.datetime) -> float | None:
+    data = json.loads(payload)
+    result = ((data.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        return None
+    timestamps = result.get("timestamp") or []
+    closes = (((result.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+    start = int(resume_at.timestamp())
+    points = [
+        (int(ts), float(close))
+        for ts, close in zip(timestamps, closes, strict=False)
+        if close is not None and start <= int(ts) <= start + 5 * 60
+    ]
+    if len(points) < 2 or points[0][1] <= 0:
+        return None
+    return round((points[-1][1] - points[0][1]) / points[0][1] * 100, 2)
+
+
 def fetch(url: str, *, timeout: float = 15) -> bytes:
     request = urllib.request.Request(
         url,
@@ -155,6 +175,19 @@ def fetch_yahoo_chart(symbol: str, halt_at: dt.datetime) -> tuple[float | None, 
     )
     payload = fetch(f"{YAHOO_CHART.format(symbol=urllib.parse.quote(yahoo_symbol))}?{query}")
     return parse_yahoo_chart(payload, halt_at)
+
+
+def fetch_yahoo_post_move(symbol: str, resume_at: dt.datetime) -> float | None:
+    query = urllib.parse.urlencode(
+        {
+            "period1": int(resume_at.timestamp()) - 300,
+            "period2": int(resume_at.timestamp()) + 600,
+            "interval": "1m",
+            "includePrePost": "true",
+        }
+    )
+    symbol = urllib.parse.quote(symbol.replace(".", "-"))
+    return parse_yahoo_post_move(fetch(f"{YAHOO_CHART.format(symbol=symbol)}?{query}"), resume_at)
 
 
 class Store:
@@ -185,11 +218,20 @@ class Store:
                     trend_pct REAL,
                     trend_points TEXT,
                     trend_checked_at TEXT,
+                    post_resume_pct REAL,
+                    post_checked_at TEXT,
                     first_seen_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL
                 )
                 """
             )
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(halts)")}
+            for name, kind in (
+                ("post_resume_pct", "REAL"),
+                ("post_checked_at", "TEXT"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE halts ADD COLUMN {name} {kind}")
 
     def upsert(self, halts: list[Halt], seen_at: dt.datetime) -> None:
         now = seen_at.isoformat()
@@ -265,6 +307,38 @@ class Store:
                 (trend_pct, json.dumps(points), checked_at.isoformat(), halt_id),
             )
 
+    def post_resume_candidates(
+        self, before: dt.datetime, *, limit: int = 6
+    ) -> list[sqlite3.Row]:
+        retry_before = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)).isoformat()
+        with self.connect() as db:
+            return db.execute(
+                """
+                SELECT id, symbol, resumption_trade_at
+                FROM halts
+                WHERE resumption_trade_at IS NOT NULL
+                  AND resumption_trade_at <= ?
+                  AND post_resume_pct IS NULL
+                  AND (post_checked_at IS NULL OR post_checked_at < ?)
+                ORDER BY resumption_trade_at DESC
+                LIMIT ?
+                """,
+                (before.isoformat(), retry_before, limit),
+            ).fetchall()
+
+    def save_post_resume(
+        self, halt_id: str, move_pct: float | None, checked_at: dt.datetime
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE halts
+                SET post_resume_pct = ?, post_checked_at = ?
+                WHERE id = ?
+                """,
+                (move_pct, checked_at.isoformat(), halt_id),
+            )
+
     def rows_for_day(self, day: dt.date) -> list[sqlite3.Row]:
         with self.connect() as db:
             return db.execute(
@@ -276,6 +350,23 @@ class Store:
                 """,
                 (day.isoformat(),),
             ).fetchall()
+
+    def rows_for_symbol(self, symbol: str, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            return db.execute(
+                """
+                SELECT *
+                FROM halts
+                WHERE symbol = ? COLLATE NOCASE
+                ORDER BY halt_at DESC
+                LIMIT ?
+                """,
+                (symbol, limit),
+            ).fetchall()
+
+    def all_rows(self) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            return db.execute("SELECT * FROM halts ORDER BY halt_at DESC").fetchall()
 
 
 class Scanner:
@@ -290,7 +381,7 @@ class Scanner:
         now = dt.datetime.now(EASTERN)
         try:
             halts = parse_nasdaq_feed(fetch(NASDAQ_FEED))
-            self.store.prune_before(now.date())
+            self.store.prune_before(now.date() - dt.timedelta(days=365))
             self.store.upsert(halts, now)
             self.last_updated = now.isoformat()
             self.last_error = None
@@ -310,28 +401,57 @@ class Scanner:
                 log.info("Yahoo chart unavailable for %s: %s", row["symbol"], exc)
             time.sleep(0.25)
 
+        for row in self.store.post_resume_candidates(now - dt.timedelta(minutes=5)):
+            try:
+                resume_at = dt.datetime.fromisoformat(row["resumption_trade_at"])
+                move_pct = fetch_yahoo_post_move(row["symbol"], resume_at)
+                self.store.save_post_resume(row["id"], move_pct, dt.datetime.now(dt.timezone.utc))
+            except Exception as exc:
+                self.store.save_post_resume(row["id"], None, dt.datetime.now(dt.timezone.utc))
+                log.info("Yahoo post-resumption price unavailable for %s: %s", row["symbol"], exc)
+            time.sleep(0.25)
+
     def run(self) -> None:
         while not self.stop_event.is_set():
             self.poll_once()
             self.stop_event.wait(self.poll_seconds)
+
+    @staticmethod
+    def item(row: sqlite3.Row, now: dt.datetime) -> dict[str, Any]:
+        item = dict(row)
+        item["trend_points"] = json.loads(item["trend_points"] or "[]")
+        item["reason"] = REASONS.get(item["reason_code"], item["reason_code"] or "Unknown")
+        quote_at = (
+            dt.datetime.fromisoformat(item["resumption_quote_at"])
+            if item["resumption_quote_at"]
+            else None
+        )
+        trade_at = (
+            dt.datetime.fromisoformat(item["resumption_trade_at"])
+            if item["resumption_trade_at"]
+            else None
+        )
+        item["resume_sort_at"] = item["resumption_trade_at"] or item["resumption_quote_at"]
+        item["is_delayed"] = bool(quote_at and quote_at <= now and trade_at is None)
+        halt_at = dt.datetime.fromisoformat(item["halt_at"])
+        item["halt_duration_seconds"] = max(
+            0, int(((trade_at or now) - halt_at).total_seconds())
+        )
+        item.pop("trend_checked_at", None)
+        item.pop("post_checked_at", None)
+        item.pop("first_seen_at", None)
+        item.pop("last_seen_at", None)
+        return item
 
     def payload(self) -> dict[str, Any]:
         now = dt.datetime.now(EASTERN)
         current: list[dict[str, Any]] = []
         resumed: list[dict[str, Any]] = []
         for row in self.store.rows_for_day(now.date()):
-            item = dict(row)
-            item["trend_points"] = json.loads(item["trend_points"] or "[]")
-            item["reason"] = REASONS.get(item["reason_code"], item["reason_code"] or "Unknown")
-            item.pop("trend_checked_at", None)
-            item.pop("first_seen_at", None)
-            item.pop("last_seen_at", None)
-            trade_at = (
-                dt.datetime.fromisoformat(item["resumption_trade_at"])
-                if item["resumption_trade_at"]
-                else None
-            )
-            (resumed if trade_at and trade_at <= now else current).append(item)
+            item = self.item(row, now)
+            trade_at = item["resumption_trade_at"]
+            target = resumed if trade_at and dt.datetime.fromisoformat(trade_at) <= now else current
+            target.append(item)
         return {
             "generated_at": now.isoformat(),
             "last_updated": self.last_updated,
@@ -339,6 +459,27 @@ class Scanner:
             "current": current,
             "resumed": resumed,
         }
+
+    def history(self, symbol: str, limit: int) -> dict[str, Any]:
+        now = dt.datetime.now(EASTERN)
+        return {
+            "symbol": symbol.upper(),
+            "halts": [self.item(row, now) for row in self.store.rows_for_symbol(symbol, limit)],
+        }
+
+    def csv_export(self) -> bytes:
+        now = dt.datetime.now(EASTERN)
+        rows = [self.item(row, now) for row in self.store.all_rows()]
+        fields = [
+            "symbol", "name", "market", "reason_code", "reason", "threshold_price",
+            "halt_at", "resumption_quote_at", "resumption_trade_at", "is_delayed",
+            "halt_duration_seconds", "trend_pct", "post_resume_pct",
+        ]
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+        return output.getvalue().encode()
 
 
 HTML = r"""<!doctype html>
@@ -408,15 +549,34 @@ class Handler(BaseHTTPRequestHandler):
     scanner: Scanner
 
     def do_GET(self) -> None:
-        if self.path == "/":
+        url = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(url.query)
+        if url.path == "/":
             self._send(200, "text/html; charset=utf-8", HTML.encode())
-        elif self.path == "/api/halts":
+        elif url.path == "/api/halts":
             self._send(
                 200,
                 "application/json",
                 json.dumps(self.scanner.payload(), separators=(",", ":")).encode(),
             )
-        elif self.path == "/healthz":
+        elif url.path == "/api/history":
+            symbol = query.get("symbol", [""])[0].strip()
+            if not symbol:
+                self._send(400, "application/json", b'{"error":"symbol is required"}')
+                return
+            try:
+                limit = min(500, max(1, int(query.get("limit", ["100"])[0])))
+            except ValueError:
+                self._send(400, "application/json", b'{"error":"limit must be an integer"}')
+                return
+            self._send(
+                200,
+                "application/json",
+                json.dumps(self.scanner.history(symbol, limit), separators=(",", ":")).encode(),
+            )
+        elif url.path == "/api/halts.csv":
+            self._send(200, "text/csv; charset=utf-8", self.scanner.csv_export())
+        elif url.path == "/healthz":
             status = 200 if self.scanner.last_updated else 503
             self._send(status, "text/plain", b"ok\n" if status == 200 else b"starting\n")
         else:
@@ -462,4 +622,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
