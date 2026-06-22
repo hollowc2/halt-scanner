@@ -109,11 +109,21 @@ def history_table(history: dict[str, Any]) -> Table:
 
 class HaltCard(Static):
     can_focus = True
+    BINDINGS = [
+        ("up", "focus_previous", "Previous halt"),
+        ("down", "focus_next", "Next halt"),
+    ]
 
     def __init__(self, halt: dict[str, Any], *, resumed: bool = False) -> None:
         super().__init__(classes=f"halt-{halt_kind(halt)}")
         self.halt = halt
         self.resumed = resumed
+
+    def action_focus_previous(self) -> None:
+        self.app.action_focus_previous()
+
+    def action_focus_next(self) -> None:
+        self.app.action_focus_next()
 
     def render(self) -> Text | Table:
         halt = self.halt
@@ -233,7 +243,7 @@ class HaltScannerTUI(App[None]):
     #body { height: 1fr; }
     .section-title { height: 2; margin: 1 2 0 2; text-style: bold; }
     .cards { height: auto; padding: 0 2; }
-    HaltCard { height: auto; min-height: 7; margin-bottom: 1; padding: 0 1; border: round #203342; background: #0d1923; }
+    HaltCard { height: auto; margin-bottom: 1; padding: 0 1; border: round #203342; background: #0d1923; }
     HaltCard:focus { background: #132837; border: heavy #45d4ff; }
     HaltCard.halt-volatility { border-left: heavy yellow; }
     HaltCard.halt-news { border-left: heavy magenta; }
