@@ -7,12 +7,45 @@ import unittest
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from rich.table import Table
+from rich.text import Text
+from textual.geometry import Size
+
 from app import Halt, Scanner, Store, parse_nasdaq_feed, parse_yahoo_chart
+from tui import HaltCard, duration, sparkline
 
 ET = ZoneInfo("America/New_York")
 
 
 class HaltScannerTests(unittest.TestCase):
+    def test_tui_formatters(self) -> None:
+        self.assertEqual(duration(3661.9), "01:01:01")
+        self.assertEqual(duration(-1), "00:00:00")
+        self.assertEqual(sparkline([[1, 10], [2, 20]]), "▁█")
+        self.assertEqual(sparkline([]), "price unavailable")
+
+    def test_tui_card_responds_to_width(self) -> None:
+        class SizedCard(HaltCard):
+            width = 120
+
+            @property
+            def size(self) -> Size:
+                return Size(self.width, 7)
+
+        halt = {
+            "symbol": "TEST",
+            "market": "NASDAQ",
+            "name": "Test Company",
+            "reason": "Volatility Trading Pause",
+            "halt_at": dt.datetime.now().astimezone().isoformat(),
+            "trend_pct": 2.5,
+            "trend_points": [[1, 10], [2, 11]],
+        }
+        card = SizedCard(halt)
+        self.assertIsInstance(card.render(), Table)
+        card.width = 80
+        self.assertIsInstance(card.render(), Text)
+
     def test_nasdaq_feed_parsing(self) -> None:
         xml = b"""<?xml version="1.0"?>
         <rss xmlns:ndaq="http://www.nasdaqtrader.com/"><channel><item>
@@ -100,4 +133,3 @@ class HaltScannerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
